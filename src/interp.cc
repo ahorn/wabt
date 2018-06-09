@@ -684,23 +684,44 @@ Value& Thread::Top() {
 }
 
 Value& Thread::Pick(Index depth) {
-  return value_stack_[value_stack_top_ - depth];
+  pick_index_ = value_stack_top_ - depth;
+  return value_stack_[pick_index_];
 }
 
 void Thread::Reset() {
   pc_ = 0;
   value_stack_top_ = 0;
+  value_stack_max_top_ = 0;
+  value_stack_i_ = 0;
+  pick_index_ = 0;
   call_stack_top_ = 0;
 }
 
 Result Thread::Push(Value value) {
   CHECK_STACK();
+  assert(value_stack_top_ <= value_stack_max_top_);
+  assert(value_stack_i_ <= value_stack_max_top_);
+  if (is_symbolic_) {
+    while (value_stack_i_ < value_stack_max_top_) {
+      expr_stack_.push_back(value_stack_[value_stack_i_++]);
+    }
+  }
+  // `value.is_symbolic` does not generally imply `is_symbolic_`. For example,
+  // consider `(set_local 0)` followed by `(get_local 0)` for a symbolic value.
+  is_symbolic_ = value.is_symbolic = value.is_symbolic || is_symbolic_;
   value_stack_[value_stack_top_++] = value;
+  value_stack_max_top_ = value_stack_top_;
+  if (is_symbolic_ || value_stack_i_ > value_stack_top_) {
+    value_stack_i_ = value_stack_top_;
+  }
+  assert(value_stack_i_ <= value_stack_top_);
   return Result::Ok;
 }
 
 Value Thread::Pop() {
-  return value_stack_[--value_stack_top_];
+  Value value = value_stack_[--value_stack_top_];
+  is_symbolic_ |= value.is_symbolic;
+  return value;
 }
 
 Value Thread::ValueAt(Index at) const {
@@ -720,7 +741,9 @@ T Thread::Pop() {
 
 template <typename T>
 Result Thread::PushRep(ValueTypeRep<T> value) {
-  return Push(MakeValue<T>(value));
+  Value v = MakeValue<T>(value);
+  v.is_symbolic = is_symbolic_;
+  return Push(v);
 }
 
 template <typename T>
@@ -765,6 +788,8 @@ Result Thread::Load(const uint8_t** pc) {
 
   void* src;
   CHECK_TRAP(GetAccessAddress<MemType>(pc, &src));
+  // TODO: Select which loads return a symbolic value
+  is_symbolic_ = true;
   MemType value;
   LoadFromMemory<MemType>(&value, src);
   return Push<ResultType>(static_cast<ExtendedType>(value));
@@ -1441,8 +1466,11 @@ Result Thread::Run(int num_instructions) {
 
   const uint8_t* istream = GetIstream();
   const uint8_t* pc = &istream[pc_];
+  is_symbolic_ = false;
+  Opcode opcode = Opcode::Nop;
   for (int i = 0; i < num_instructions; ++i) {
-    Opcode opcode = ReadOpcode(&pc);
+    is_symbolic_ = false;
+    opcode = ReadOpcode(&pc);
     assert(!opcode.IsInvalid());
     switch (opcode) {
       case Opcode::Select: {
@@ -2370,6 +2398,8 @@ Result Thread::Run(int num_instructions) {
         uint32_t old_value_stack_top = value_stack_top_;
         size_t count = ReadU32(&pc);
         value_stack_top_ += count;
+        value_stack_max_top_ += count;
+        value_stack_i_ += count;
         CHECK_STACK();
         memset(&value_stack_[old_value_stack_top], 0, count * sizeof(Value));
         break;
@@ -3158,6 +3188,14 @@ Result Thread::Run(int num_instructions) {
       case Opcode::Try:
         WABT_UNREACHABLE;
         break;
+    }
+    if (is_symbolic_) {
+      assert(opcode != Opcode::Nop);
+      if (opcode == Opcode::GetLocal or opcode == Opcode::SetLocal) {
+        expr_stack_.emplace_back(opcode, pick_index_);
+      } else {
+        expr_stack_.push_back(opcode);
+      }
     }
   }
 
@@ -4489,6 +4527,17 @@ ExecResult Executor::RunExportByName(Module* module,
     return ExecResult(Result::ExportKindMismatch);
   }
   return RunExport(export_, args);
+}
+
+void Executor::WriteExprStack(Stream* stream) {
+  stream->Writef("Expr stack size: %lu\n", thread_.ExprStack().size());
+  for (auto& expr : thread_.ExprStack()) {
+    if (expr.is_op) {
+      stream->Writef("Op:%s %u\n", expr.op.opcode.GetName(), expr.op.pick_index);
+    } else {
+      stream->Writef("V:%u\n", expr.value.i32);
+    }
+  }
 }
 
 Result Executor::RunDefinedFunction(IstreamOffset function_offset) {

@@ -243,6 +243,8 @@ static wabt::Result ReadAndRunModule(const char* module_filename) {
       if (s_run_all_exports) {
         RunAllExports(module, &executor, RunVerbosity::Verbose);
       }
+      // TODO: Use flag
+      executor.WriteExprStack(s_stdout_stream.get());
     } else {
       WriteResult(s_stdout_stream.get(), "error running start function",
                   exec_result.result);

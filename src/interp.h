@@ -137,12 +137,48 @@ template <> struct ValueTypeRepT<v128> { typedef v128 type; };
 template <typename T>
 using ValueTypeRep = typename ValueTypeRepT<T>::type;
 
-union Value {
-  uint32_t i32;
-  uint64_t i64;
-  ValueTypeRep<float> f32_bits;
-  ValueTypeRep<double> f64_bits;
-  ValueTypeRep<v128> v128_bits;
+struct Value {
+  bool is_symbolic = false;
+  union {
+    uint32_t i32;
+    uint64_t i64;
+    ValueTypeRep<float> f32_bits;
+    ValueTypeRep<double> f64_bits;
+    ValueTypeRep<v128> v128_bits;
+  };
+};
+
+struct Op {
+  const Opcode opcode;
+  const Index pick_index = 0;
+
+  Op(Opcode opcode)
+      : opcode(opcode) {
+    assert(opcode != Opcode::SetLocal && opcode != Opcode::GetLocal);
+  }
+
+  Op(Opcode opcode, Index pick_index)
+      : opcode(opcode), pick_index(pick_index) {
+    assert(opcode == Opcode::SetLocal || opcode == Opcode::GetLocal);
+  }
+};
+
+struct Expr {
+  const bool is_op;
+
+  Expr(Value value)
+      : is_op(false), value(value) {}
+
+  Expr(Opcode opcode)
+      : is_op(true), op(opcode) {}
+
+  Expr(Opcode opcode, Index pick_index)
+      : is_op(true), op(opcode, pick_index) {}
+
+  union {
+    const Value value;
+    const Op op;
+  };
 };
 
 struct TypedValue {
@@ -494,6 +530,10 @@ class Thread {
 
   Result CallHost(HostFunc*);
 
+  const std::vector<Expr>& ExprStack() const {
+    return expr_stack_;
+  }
+
  private:
   const uint8_t* GetIstream() const { return env_->istream_->data.data(); }
 
@@ -563,10 +603,15 @@ class Thread {
   Result SimdBinop(BinopFunc<R, P> func) WABT_WARN_UNUSED;
 
   Environment* env_ = nullptr;
+  bool is_symbolic_ = false;
+  std::vector<Expr> expr_stack_;
   std::vector<Value> value_stack_;
   std::vector<IstreamOffset> call_stack_;
   uint32_t value_stack_top_ = 0;
+  uint32_t value_stack_i_ = 0;
+  uint32_t value_stack_max_top_ = 0;
   uint32_t call_stack_top_ = 0;
+  Index pick_index_ = 0;
   IstreamOffset pc_ = 0;
 };
 
@@ -593,6 +638,7 @@ class Executor {
                              string_view name,
                              const TypedValues& args);
 
+  void WriteExprStack(Stream*);
  private:
   Result RunDefinedFunction(IstreamOffset function_offset);
   Result PushArgs(const FuncSignature*, const TypedValues& args);
